@@ -85,64 +85,76 @@
 
 ;(alias play play-notes)
 
-(defn chord-player
+(defn progression-player
   "Play a progression using block chords (all notes at same time)."
-  [t len inst chords vel]
+  [style-fn t len inst chords vel speed]
   (when chords
-    (let [next-t (+ t len)
-          notes (:notes (first chords))]
-      (at t (inst (- (first notes) 12) vel))
-      (play-notes t inst notes vel)
-      (apply-at next-t #'chord-player [next-t len inst (next chords) vel]))))
+    (let [next-t (+ t len)]
+      (doseq [[note-t note note-vel] (style-fn (:notes (first chords)) len vel speed)]
+        (at (+ t note-t) (inst note note-vel)))
+      (apply-at next-t #'progression-player [style-fn next-t len inst (next chords) vel speed]))))
 
-(defn arpeggiate-notes
-  "Arpeggiate the notes in a chord, playing them one at a time from low to high."
-  ([inst-fn notes vel speed]
-   (arpeggiate-notes (now) speed inst-fn notes vel))
-  ([t inst-fn notes vel speed]
-   (reduce
-        (fn [next-t note]
-          (at next-t
-              (inst-fn note vel))
-          (+ next-t speed))
-        t
-        notes)))
+(defn offset 
+  "Given a schedule (notes at certain times) adjust their times by off."
+  [off]
+  (fn [[t & more]]
+    (cons (+ t off) more)))
 
-(def strum #'arpeggiate-notes)
+(defn comp-style 
+  "Compose several styles together into a single style."
+  [& styles]
+  (fn [notes len vel speed]
+    (apply concat ((apply juxt styles) notes len vel speed))))
 
-(defn broken-chord-player
-  "Play a progression using block chords (all notes at same time)."
-  [t len inst chords vel speed]
-  (when chords
-    (let [next-t (+ t len)
-          notes (:notes (first chords))
-          broken [(nth notes 2) (first notes) (second notes) (first notes)]
-          broken-notes (concat broken broken)
-          synco (+ t (* 3.5 speed))]
-      ; bass note
-      (at t (inst (- (first notes) 12) (- vel 15)))
+(defn block-style 
+  "Play all notes in each chord simultaneously"
+  [notes len vel speed]
+  (for [n (cons (- (first notes) 12) notes)]
+    [0 n vel]))
 
-      ; broken or rocked
-      (if (zero? (rand-int 2))
-        (strum synco inst (choose [notes broken-notes]) vel speed)
-        (do
-          (play-notes synco inst (next notes) (- vel 20))
-          (play-notes (+ synco (* 1 speed)) inst [(first notes)] vel)
-          (play-notes (+ synco (* 2 speed)) inst (next notes) (- vel 20))
-          (play-notes (+ synco (* 3 speed)) inst [(first notes)] vel)
-          ))
+; Define a player that uses block style
+(def block-chord-player (partial progression-player block-style))
 
-      (apply-at next-t #'broken-chord-player [next-t len inst (next chords) vel speed]))))
+(defn bass-note-style 
+  "Play the first note in each chord adjusted by the given number
+  of octaves down."
+  [octaves]
+  (fn [notes len vel speed]
+    [[0 (- (first notes) (* octaves 12)) (- vel 15)]]))
 
-(defn arp-player
-  "Play the chords in a progression in arpeggios."
-  [t len inst chords vel speed]
-  (when chords
-    (let [next-t (+ t len)
-          notes (sort (:notes (first chords)))]
-      (at t (inst (- (first notes) 24) (- vel 25)))
-      (strum t inst notes vel speed)
-      (apply-at next-t #'arp-player [next-t len inst (next chords) vel speed]))))
+(defn arpeggiated-style 
+  "Arpeggiate each chord"
+  [notes len vel speed]
+  (for [[i n] (map-indexed vector (sort notes))]
+    [(* i speed) n vel]))
+
+; Define a player that plays a bass note and arpeggiates the chord
+(def arp-player 
+  (partial progression-player 
+           (comp-style (bass-note-style 2) arpeggiated-style)))
+
+
+(defn broken-style
+  "Jeff's 'broken' style. Doesn't include base notes."
+  [notes len vel speed]
+  (let [broken [(nth notes 2) (first notes) (second notes) (first notes)]
+        broken-notes (concat broken broken)
+        synco (* 3.5 speed)]
+    ; broken or rocked
+    (if (zero? (rand-int 2))
+      (map (offset synco) 
+            (arpeggiated-style (choose [notes broken-notes]) len vel speed))
+      (concat 
+        (block-style (next notes) len (- vel 20) speed)
+        [[(+ synco (* 1 speed)) (first notes) vel]]
+        (map (offset (+ synco (* 2 speed))) 
+              (block-style (next notes) len (- vel 20) speed ))
+        [[(+ synco (* 3 speed)) (first notes) vel]]))))
+
+; Jeff's broken player. Compose broken style with bass notes.
+(def broken-chord-player 
+  (partial progression-player 
+           (comp-style (bass-note-style 1) broken-style)))
 
 ; left hand arpeggiates the chord [:i :iii :v :vi] 2 octaves below middle C
 ; from low to hi while the right hand plays straight chord on the up beats.
@@ -150,16 +162,22 @@
   "Play a left and right hand chord progressions using a blues shuffle style.
   (bass notes arpeggiated, and right hand as block chords)"
   [t len inst treble-chords bass-chords vel]
-  (when (and treble-chords bass-chords)
-    (let [next-t (+ t len)
-          treble-notes (:notes (first treble-chords))
-          bass-notes (sort (:notes (first bass-chords)))]
-      (strum t inst bass-notes vel (* 0.25 len))
-      (dotimes [i 4]
-        (play-notes (+ t (* i 0.25 len) (* 0.125 len)) inst treble-notes (- vel 10)))
-      (apply-at next-t #'shuffle-player [next-t len inst
-                                         (next treble-chords) (next bass-chords)
-                                         vel]))))
+
+  ; TODO This isn't very satisfying
+
+  ; One player plays the arpeggiated bass notes  
+  (progression-player 
+    (fn [notes len vel speed]
+      (arpeggiated-style notes len vel (* 0.25 len)))
+      t len inst bass-chords vel 0)
+  
+  ; Another plays the right hand on off beats. 
+  (progression-player 
+    (fn [notes len vel speed]
+      (apply concat (for [i (range 4)]
+        (map (offset (+ (* i 0.25 len) (* 0.125 len)))
+            (block-style notes len vel speed)))))
+      t len inst treble-chords (- vel 10) 0))
 
 (definst z
   [note 60 amp 0.8 len 0.4
@@ -218,6 +236,21 @@
        (-> (chord-progression :g3 :diatonic diatonic-trichords (nth blues-progressions 0))
          (update-all :notes #(invert-chord % 2))))
 
+(block-chord-player (+ 100 (now)) bar-ms #'p
+              (chord-progression :Bb3 :diatonic diatonic-trichords
+                                 (expand-by 2 (nth jazz-progressions 0)))
+              60 0)
+(arp-player (+ 100 (now)) bar-ms #'p
+            (chord-progression :e3 :diatonic diatonic-trichords
+                               (expand-by 2 (nth jazz-progressions 2)))
+            60 strum-ms)
+(broken-chord-player (+ 100 (now)) bar-ms #'p
+              (chord-progression :Bb3 :diatonic diatonic-trichords
+                                 (expand-by 2 (nth jazz-progressions 0)))
+              60 strum-ms)
+(shuffle-player (+ 100 (now)) 2200 #'p
+                treble-chords bass-chords
+                60)
 (comment
 ; best played with the piano (otherwise it sounds super cheesy)
 (shuffle-player (+ 100 (now)) 2200 #'p
@@ -226,20 +259,20 @@
 
 ; Eval each of these to hear various progressions played in different ways
 
-(chord-player (+ 100 (now)) bar-ms #'p
+(block-chord-player (+ 100 (now)) bar-ms #'p
               (chord-progression :Bb3 :diatonic diatonic-trichords
                                  (expand-by 2 (nth jazz-progressions 0)))
-              60)
+              60 0)
 
 (broken-chord-player (+ 100 (now)) bar-ms #'p
               (chord-progression :Bb3 :diatonic diatonic-trichords
                                  (expand-by 2 (nth jazz-progressions 0)))
               60 strum-ms)
 
-(chord-player (+ 100 (now)) bar-ms #'p
+(block-chord-player (+ 100 (now)) bar-ms #'p
               (chord-progression :a4 :diatonic diatonic-tetrachords
                                  (nth blues-progressions 0))
-              60)
+              60 0)
 
 (arp-player (+ 100 (now)) bar-ms #'p
             (chord-progression :e3 :diatonic diatonic-trichords
